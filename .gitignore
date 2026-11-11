@@ -1,0 +1,15 @@
+# data and large files
+data/
+*.pkl
+*.nc
+*.fif
+
+# python
+__pycache__/
+*.pyc
+.venv/
+.ipynb_checkpoints/
+.idea/
+
+# OS
+.DS_Store
