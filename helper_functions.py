@@ -59,16 +59,22 @@ def simulate_from_hmpfit(epoch_data,
     sfreq = epoch_data.sfreq
     n_chan, _, n_events = np.shape(weights)
     surrogate = epoch_data.copy(deep=True)
-    surrogate['data'] = 0 * surrogate['data']#Overwrite all the real data
+    surrogate['data'] = 0 * surrogate['data'] #Overwrite all the real data
     surrogate = surrogate.stack({'trial':["recording","epoch"]})
+
     # Add event activations at corresponding times
     for trial in times.trial:
+        #for each trial: get events times and RT
         trial_times = times.sel(trial=trial).values
         trial_rt = int(trial_times[-1])
-        # use weights of each event, sum over events,
+
+        # use weights of each event, sum over events
         for event in range(n_events):
             trial_template = template_dict[event]
+            
             # EA traces are defined from 2nd event to last
+            # 2 possibilities:
+            # 1) template: evidence accumulation (the ramp)
             if isinstance(trial_template, EvidenceAccumulation):
                 prev_ev = trial_times[event-2].astype(int)
                 dist_from_prev = trial_times[event]-prev_ev
@@ -76,19 +82,26 @@ def simulate_from_hmpfit(epoch_data,
                 length_of_event = len(trial_template)
                 proposed_onset = prev_ev
                 proposed_offset = prev_ev+length_of_event
+            # 2) template: half-sine
             else:# Half-Sine's peak is symetric
                 trial_template = trial_template.template
-                length_of_event = len(trial_template)   
+                length_of_event = len(trial_template)
+                # centered bump: starts half a bump before and ends half a bump after.
                 proposed_onset = trial_times[event].astype(int) - length_of_event // 2
-                proposed_offset = trial_times[event].astype(int) + length_of_event // 2 + 1
+                proposed_offset = trial_times[event].astype(int) + length_of_event // 2 + 1 # + 1 because last index not taken
+
+                # if length_of_event even, it would give one sample too many, so the if removes it.
                 if length_of_event%2 == 0:
                     proposed_offset -= 1
+
             # Ensures that pattern doesn't exceed stim/RT boundaries if detected event close to those
-            onset = max(proposed_onset, 0)
-            offset = min(proposed_offset, trial_rt)
+            # If an event is very close to the stimulus (time 0) or to the response (RT), part of the bump would fall outside the trial.
+            onset = max(proposed_onset, 0) # The bump can’t start before 0. If it would, start at 0 instead
+            offset = min(proposed_offset, trial_rt) # The bump can’t end after the RT. If it would, end at the RT instead
             length = offset - onset
-            trim_start = onset - proposed_onset
-            trim_end = proposed_offset - offset
+            trim_start = onset - proposed_onset # How many template values to drop at the start
+            trim_end = proposed_offset - offset # How many template values to drop at the end
+
             surrogate.sel(trial=trial)['data'][:,onset:offset] += \
                 np.outer(trial_template[trim_start:length_of_event - trim_end],\
                          weights.sel(trial = trial, event=event).values).T
