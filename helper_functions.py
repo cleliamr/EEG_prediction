@@ -182,14 +182,182 @@ Metrics use sklearn.metrics where a function exists
 (r2_score, explained_variance_score, mean_squared_error, mean_absolute_error).
 sklearn has no Pearson correlation, so that one is computed with numpy.
 """
-
-
-SKLEARN_METRICS = {
+# ====================================================================================
+# 1. METRICS FOR ONE BLOCK OF EEG (channel x sample) -> ONE VALUE PER ELECTRODE
+# ====================================================================================
+METRICS = {
     "r2": r2_score,
     "explained_variance": explained_variance_score,
     "mse": mean_squared_error,
     "mae": mean_absolute_error,
+    "corr": _pearson,
 }
 
 
+def _per_channel(y, yhat, metric):
+    """Apply a metric to one block of EEG, one value per electrode.
 
+    y, yhat : arrays of shape (channel, sample) (one trial, or one ERP).
+
+    sklearn constraints handled here:
+    - it expects (n_samples, n_outputs): time points are the samples and
+      electrodes the outputs, so the block is transposed;
+    - it crashes on NaN: only time points valid on every electrode are kept
+      (within a trial, all electrodes share the same valid samples, i.e. up to the RT).
+
+    Returns an array of shape (channel,), NaN if fewer than 2 valid samples.
+    """
+    keep = ~(np.isnan(y).any(axis=0) | np.isnan(yhat).any(axis=0))
+    # `multioutput="raw_values"` returns one score per electrode, not their mean
+    return METRICS[metric](y[:, keep].T, yhat[:, keep].T, multioutput="raw_values")
+
+
+def _pearson(y_true, y_pred, multioutput="raw_values"):
+    """Pearson correlation per column, with the same signature as sklearn metrics.
+
+    # sklearn's `multioutput` option: what to return when there are several outputs
+    # (here, several electrodes = several columns)
+    #
+    #   "uniform_average"    (default)  -> plain average of the electrodes' scores: one single number
+    #   "variance_weighted"             -> average weighted by each electrode's variance: one number
+    #                                      (only for r2_score and explained_variance_score)
+    #   "raw_values"                    -> one score per electrode: array of shape (n_electrodes,)
+    #
+    # Use "raw_values" so the score is computed per electrode; averaging over
+    # electrodes is done afterwards, only if requested (by_channel=False in aggregate).
+
+    y_true, y_pred : arrays of shape (n_samples, n_channels).
+    Returns an array of shape (n_channels,).
+    """
+    yt = y_true - y_true.mean(axis=0)
+    yp = y_pred - y_pred.mean(axis=0)
+    den = np.sqrt((yt ** 2).sum(axis=0) * (yp ** 2).sum(axis=0))
+    with np.errstate(invalid="ignore", divide="ignore"): # ignoring warnings
+        return (yt * yp).sum(axis=0) / den  # flat signal -> NaN
+
+# =============================================================================
+# 2. DATA PREPARATION FUNCTIONS
+# =============================================================================
+
+def _align(real_ds, pred_ds):
+    """Same participants, trials, electrodes and samples in both, same NaN pattern.
+
+    - xr.align(join="inner") keeps only the labels present in both datasets.
+    - Every sample that is NaN in either array is set to NaN in both, so the
+      model is scored only where real data exist: on trials kept by HMP and
+      between stimulus and RT (provided epoch_data was cut with cut_at_rt).
+
+    Returns two DataArrays (recording, epoch, channel, sample).
+    """
+    real, pred = xr.align(real_ds, pred_ds, join="inner")
+    real, pred = real.astype(float), pred.astype(float)
+    valid = real.notnull() & pred.notnull()
+    return real.where(valid), pred.where(valid)
+
+
+
+# =============================================================================
+# 3. SCORES FUNCTIONS PER ELECTRODE
+# =============================================================================
+
+def compute_metric(real_ds, pred_ds, metric="r2", level="single"):
+    """Compute a metric electrode by electrode.
+
+    Parameters
+    ----------
+    real_ds, pred_ds : xarray.Dataset, dims (recording, epoch, channel, sample)
+    metric : one of METRICS ("r2", "explained_variance", "mse", "mae", "corr")
+    level : "single"  -> one score per trial and electrode
+            "average" -> for each participant, real and predicted EEG are first
+                         averaged over trials (ERP), then compared:
+                         one score per participant and electrode
+
+    Returns
+    -------
+    xarray.DataArray
+        level="single" : dims (recording, epoch, channel); NaN for empty trials
+        level="average": dims (recording, channel)
+
+    Notes
+    -----
+    - Single-trial scores are low (a few % of variance): most single-trial
+      EEG is activity HMP doesn't model. Compare to a baseline (skill_score).
+    - Average-level scores are much higher (noise averages out) but hide the
+      trial-by-trial jitter HMP is built to capture.
+    """
+    if metric not in METRICS:
+        raise ValueError(f"metric must be one of {list(METRICS)}")
+    real, pred = _align(real_ds, pred_ds) # taking Nan out
+    R, P = real.values, pred.values  # (recording, epoch, channel, sample)
+    n_rec, n_ep, n_ch, _ = R.shape
+
+    if level == "single":
+        out = np.full((n_rec, n_ep, n_ch), np.nan) # empty result table
+        for r in range(n_rec): # each participant
+            for e in range(n_ep): # each trial of that participant
+                if np.isnan(R[r, e]).all():  # Skip empty trials (trial rejected by HMP / empty)
+                    continue
+                out[r, e] = _per_channel(R[r, e], P[r, e], metric) # Compute the score for this trial
+        return xr.DataArray(out, dims=("recording", "epoch", "channel"),
+                            coords={"recording": real.recording, "epoch": real.epoch,
+                                    "channel": real.channel}, name=metric)
+
+    if level == "average":
+        out = np.full((n_rec, n_ch), np.nan) # empty result table
+        with np.errstate(invalid="ignore"):  # samples after every RT -> empty mean (No warning)
+            erp_real = np.nanmean(R, axis=1)  # (recording, channel, sample)
+            erp_pred = np.nanmean(P, axis=1)
+        for r in range(n_rec): # One score per participant
+            out[r] = _per_channel(erp_real[r], erp_pred[r], metric)
+        return xr.DataArray(out, dims=("recording", "channel"),
+                            coords={"recording": real.recording, "channel": real.channel},
+                            name=metric)
+
+    raise ValueError('level must be "single" or "average"')
+
+
+# =============================================================================
+# 4. MAIN SCORING FUNCTIONS
+# =============================================================================
+def average(scores, by_trial=True, by_channel=True, by_participant=True, agg="mean"):
+    """Average the per-electrode scores over the dimensions you don't want to keep.
+
+    Parameters
+    ----------
+    scores : DataArray from compute_metric
+    by_trial : keep one score per trial (only used if scores have an 'epoch' dim)
+    by_channel : keep one score per electrode
+    by_participant : keep one score per participant
+    agg : "mean" or "median" (median is more robust: single-trial scores have outliers)
+
+    Returns
+    -------
+    DataArray with only the kept dimensions (a single number if all are False).
+    NaNs (empty trials) are skipped.
+    """
+    dims = []
+    if not by_trial and "epoch" in scores.dims:
+        dims.append("epoch")
+    if not by_channel:
+        dims.append("channel")
+    if not by_participant:
+        dims.append("recording")
+    if not dims:
+        return scores
+    if agg == "mean":
+        return scores.mean(dim=dims, skipna=True)
+    if agg == "median":
+        return scores.median(dim=dims, skipna=True)
+    raise ValueError('agg must be "mean" or "median"')
+
+def score(real_ds, pred_ds, metric="r2", level="single",
+          by_trial=True, by_channel=True, by_participant=True,
+          agg="mean"):
+    """Compute a metric per electrode, then average it as requested (True = averaged)
+
+    Example: one R2 per participant, single trials, averaged over trials and electrodes
+        score(real, pred, "r2", level="single",
+              by_trial=False, by_channel=False, by_participant=True)
+    """
+    raw = compute_metric(real_ds, pred_ds, metric, level)
+    return average(raw, by_trial, by_channel, by_participant, agg)
