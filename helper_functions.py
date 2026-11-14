@@ -185,6 +185,30 @@ sklearn has no Pearson correlation, so that one is computed with numpy.
 # ====================================================================================
 # 1. METRICS FOR ONE BLOCK OF EEG (channel x sample) -> ONE VALUE PER ELECTRODE
 # ====================================================================================
+def _pearson(y_true, y_pred, multioutput="raw_values"):
+    """Pearson correlation per column, with the same signature as sklearn metrics.
+
+    # sklearn's `multioutput` option: what to return when there are several outputs
+    # (here, several electrodes = several columns)
+    #
+    #   "uniform_average"    (default)  -> plain average of the electrodes' scores: one single number
+    #   "variance_weighted"             -> average weighted by each electrode's variance: one number
+    #                                      (only for r2_score and explained_variance_score)
+    #   "raw_values"                    -> one score per electrode: array of shape (n_electrodes,)
+    #
+    # Use "raw_values" so the score is computed per electrode; averaging over
+    # electrodes is done afterwards, only if requested (by_channel=False in aggregate).
+
+    y_true, y_pred : arrays of shape (n_samples, n_channels).
+    Returns an array of shape (n_channels,).
+    """
+    yt = y_true - y_true.mean(axis=0)
+    yp = y_pred - y_pred.mean(axis=0)
+    den = np.sqrt((yt ** 2).sum(axis=0) * (yp ** 2).sum(axis=0))
+    with np.errstate(invalid="ignore", divide="ignore"): # ignoring warnings
+        return (yt * yp).sum(axis=0) / den  # flat signal -> NaN
+
+
 METRICS = {
     "r2": r2_score,
     "explained_variance": explained_variance_score,
@@ -212,28 +236,7 @@ def _per_channel(y, yhat, metric):
     return METRICS[metric](y[:, keep].T, yhat[:, keep].T, multioutput="raw_values")
 
 
-def _pearson(y_true, y_pred, multioutput="raw_values"):
-    """Pearson correlation per column, with the same signature as sklearn metrics.
 
-    # sklearn's `multioutput` option: what to return when there are several outputs
-    # (here, several electrodes = several columns)
-    #
-    #   "uniform_average"    (default)  -> plain average of the electrodes' scores: one single number
-    #   "variance_weighted"             -> average weighted by each electrode's variance: one number
-    #                                      (only for r2_score and explained_variance_score)
-    #   "raw_values"                    -> one score per electrode: array of shape (n_electrodes,)
-    #
-    # Use "raw_values" so the score is computed per electrode; averaging over
-    # electrodes is done afterwards, only if requested (by_channel=False in aggregate).
-
-    y_true, y_pred : arrays of shape (n_samples, n_channels).
-    Returns an array of shape (n_channels,).
-    """
-    yt = y_true - y_true.mean(axis=0)
-    yp = y_pred - y_pred.mean(axis=0)
-    den = np.sqrt((yt ** 2).sum(axis=0) * (yp ** 2).sum(axis=0))
-    with np.errstate(invalid="ignore", divide="ignore"): # ignoring warnings
-        return (yt * yp).sum(axis=0) / den  # flat signal -> NaN
 
 # =============================================================================
 # 2. DATA PREPARATION FUNCTIONS
