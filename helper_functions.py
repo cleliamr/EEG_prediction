@@ -3,6 +3,14 @@ import pandas as pd
 from mne import compute_covariance, cov, read_epochs, filter
 from scipy.signal import lfilter
 import gc
+##
+import xarray as xr
+from sklearn.metrics import (
+    r2_score,
+    explained_variance_score,
+    mean_squared_error,
+    mean_absolute_error,
+)
 
 # Defininf a half-sine, as the one expected by HMP
 class HalfSine:
@@ -160,3 +168,28 @@ def create_noise(recording, sfreq, n_trials, n_samples):
         noise = noise * (data_std / np.std(noise))
         noise_matrix[trial] = noise
     return noise_matrix
+
+
+###### NEW CODE ######
+"""Scoring synthetic EEG (from a fitted HMP model) against real EEG.
+
+Main entry point: `score_all(epoch_data, simulated, rt_samples)`.
+Both inputs are xarray Datasets with a 'data' variable and dims
+(recording, epoch, channel, sample), as returned by
+`hmp.io.read_mne_epochs` and `simulate_from_hmpfit`.
+
+Metrics use sklearn.metrics where a function exists
+(r2_score, explained_variance_score, mean_squared_error, mean_absolute_error).
+sklearn has no Pearson correlation, so that one is computed with numpy.
+"""
+
+
+SKLEARN_METRICS = {
+    "r2": r2_score,
+    "explained_variance": explained_variance_score,
+    "mse": mean_squared_error,
+    "mae": mean_absolute_error,
+}
+
+
+
