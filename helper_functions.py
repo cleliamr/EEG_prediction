@@ -185,7 +185,7 @@ sklearn has no Pearson correlation, so that one is computed with numpy.
 # ====================================================================================
 # 1. METRICS FOR ONE BLOCK OF EEG (channel x sample) -> ONE VALUE PER ELECTRODE
 # ====================================================================================
-def _pearson(y_true, y_pred, multioutput="raw_values"):
+def pearson(y_true, y_pred, multioutput="raw_values"):
     """Pearson correlation per column, with the same signature as sklearn metrics.
 
     # sklearn's `multioutput` option: what to return when there are several outputs
@@ -214,11 +214,11 @@ METRICS = {
     "explained_variance": explained_variance_score,
     "mse": mean_squared_error,
     "mae": mean_absolute_error,
-    "corr": _pearson,
+    "corr": pearson,
 }
 
 
-def _per_channel(y, yhat, metric):
+def per_channel(y, yhat, metric):
     """Apply a metric to one block of EEG, one value per electrode.
 
     y, yhat : arrays of shape (channel, sample) (one trial, or one ERP).
@@ -236,131 +236,97 @@ def _per_channel(y, yhat, metric):
     return METRICS[metric](y[:, keep].T, yhat[:, keep].T, multioutput="raw_values")
 
 
-
-
-# =============================================================================
-# 2. DATA PREPARATION FUNCTIONS
-# =============================================================================
-
-def _align(real_ds, pred_ds):
-    """Same participants, trials, electrodes and samples in both, same NaN pattern.
-
-    - xr.align(join="inner") keeps only the labels present in both datasets.
-    - Every sample that is NaN in either array is set to NaN in both, so the
-      model is scored only where real data exist: on trials kept by HMP and
-      between stimulus and RT (provided epoch_data was cut with cut_at_rt).
-
-    Returns two DataArrays (recording, epoch, channel, sample).
-    """
-    real, pred = xr.align(real_ds, pred_ds, join="inner")
-    real, pred = real.astype(float), pred.astype(float)
-    valid = real.notnull() & pred.notnull()
-    return real.where(valid), pred.where(valid)
+# -----------------------------------------------------------------------------
+# 2. Averaging the signals
+# -----------------------------------------------------------------------------
+def average_signals(da, average_trial=False, average_participant=False):
+    """Average an EEG DataArray (recording, epoch, channel, sample) over trials
+    and/or participants. NaNs (rejected trials, samples after the RT) are skipped."""
+    if average_participant and not average_trial:
+        print("average_participant=True requires average_trial=True: average_trial was set to True")
+        print("(trials of different participants can't be averaged together)")
+        average_trial = True
+    if average_trial:
+        da = da.mean("epoch", skipna=True)  # 1. ERP of each participant
+    if average_participant:
+        da = da.mean("recording", skipna=True)  # 2. average of the ERPs
+    return da
 
 
 
-# =============================================================================
-# 3. SCORES FUNCTIONS PER ELECTRODE
-# =============================================================================
-
-def compute_metric(real_ds, pred_ds, metric="r2", level="single"):
-    """Compute a metric electrode by electrode.
+# -----------------------------------------------------------------------------
+# 3. Score
+# -----------------------------------------------------------------------------
+def score(real_ds, pred_ds, metric="r2",
+          average_trial=False, average_participant=False, average_channel=False,
+          agg="mean"):
+    """Average the signals as requested, then compute `metric` per electrode.
 
     Parameters
     ----------
-    real_ds, pred_ds : xarray.Dataset, dims (recording, epoch, channel, sample)
-    metric : one of METRICS ("r2", "explained_variance", "mse", "mae", "corr")
-    level : "single"  -> one score per trial and electrode
-            "average" -> for each participant, real and predicted EEG are first
-                         averaged over trials (ERP), then compared:
-                         one score per participant and electrode
+    real_ds, pred_ds : xarray Datasets, dims (recording, epoch, channel, sample)
+    metric : "r2", "explained_variance", "mse", "mae" or "corr"
+    average_trial : True -> average the signals over trials before scoring
+    average_participant : True -> average the signals over participants before scoring
+    average_channel : True -> average the electrode SCORES at the end
+    agg : "mean" or "median", used only to average the electrode scores
 
     Returns
     -------
-    xarray.DataArray
-        level="single" : dims (recording, epoch, channel); NaN for empty trials
-        level="average": dims (recording, channel)
-
-    Notes
-    -----
-    - Single-trial scores are low (a few % of variance): most single-trial
-      EEG is activity HMP doesn't model. Compare to a baseline (skill_score).
-    - Average-level scores are much higher (noise averages out) but hide the
-      trial-by-trial jitter HMP is built to capture.
+    xarray DataArray with the kept dims (see the table at the top of the file).
     """
     if metric not in METRICS:
         raise ValueError(f"metric must be one of {list(METRICS)}")
-    real, pred = _align(real_ds, pred_ds) # taking Nan out
-    R, P = real.values, pred.values  # (recording, epoch, channel, sample)
-    n_rec, n_ep, n_ch, _ = R.shape
 
-    if level == "single":
-        out = np.full((n_rec, n_ep, n_ch), np.nan) # empty result table
-        for r in range(n_rec): # each participant
-            for e in range(n_ep): # each trial of that participant
-                if np.isnan(R[r, e]).all():  # Skip empty trials (trial rejected by HMP / empty)
-                    continue
-                out[r, e] = _per_channel(R[r, e], P[r, e], metric) # Compute the score for this trial
-        return xr.DataArray(out, dims=("recording", "epoch", "channel"),
-                            coords={"recording": real.recording, "epoch": real.epoch,
-                                    "channel": real.channel}, name=metric)
+    dims = ("recording", "epoch", "channel", "sample")
+    real = real_ds["data"].transpose(*dims).astype(float)
+    pred = pred_ds["data"].transpose(*dims).astype(float)
 
-    if level == "average":
-        out = np.full((n_rec, n_ch), np.nan) # empty result table
-        with np.errstate(invalid="ignore"):  # samples after every RT -> empty mean (No warning)
-            erp_real = np.nanmean(R, axis=1)  # (recording, channel, sample)
-            erp_pred = np.nanmean(P, axis=1)
-        for r in range(n_rec): # One score per participant
-            out[r] = _per_channel(erp_real[r], erp_pred[r], metric)
-        return xr.DataArray(out, dims=("recording", "channel"),
-                            coords={"recording": real.recording, "channel": real.channel},
-                            name=metric)
+    # Same NaNs in both, BEFORE averaging: both averages then use exactly the same trials
+    valid = real.notnull() & pred.notnull()
+    real, pred = real.where(valid), pred.where(valid)
 
-    raise ValueError('level must be "single" or "average"')
+    # 1. Average the signals
+    with np.errstate(invalid="ignore"):              # ignore warning (samples after every RT -> empty mean)
+        real = average_signals(real, average_trial, average_participant)
+        pred = average_signals(pred, average_trial, average_participant)
 
+    # 2. Score per electrode, for every remaining block (trial / participant / grand average)
+    # After average_signals, the dimensions left depend on what averaged:
+    # Nothing averaged	(recording, epoch, channel, sample)
+    # average_trial=True	(recording, channel, sample)
+    # average_trial + average_participant	(channel, sample)
+    lead = [d for d in real.dims if d not in ("channel", "sample")]
+    # Puts channel and sample at the end, the others in front
+    real = real.transpose(*lead, "channel", "sample")
+    pred = pred.transpose(*lead, "channel", "sample")
+    # Number of electrodes and time points
+    n_ch, n_s = real.sizes["channel"], real.sizes["sample"]
+    lead_shape = tuple(real.sizes[d] for d in lead)
 
-# =============================================================================
-# 4. MAIN SCORING FUNCTIONS
-# =============================================================================
-def average(scores, by_trial=True, by_channel=True, by_participant=True, agg="mean"):
-    """Average the per-electrode scores over the dimensions you don't want to keep.
+    # All dimensions  merged into one
+    R = real.values.reshape(-1, n_ch, n_s)           # (n_blocks, channel, sample)
+    P = pred.values.reshape(-1, n_ch, n_s)
+    out = np.full((R.shape[0], n_ch), np.nan)
+    for b in range(R.shape[0]):                     # b = block number: 0, 1, 2, ...
+        # block = piece of EEG of shape (electrodes, time) that gets scored separately
+        # Nothing averaged: One block = One trial of one participant
+        # average_trial=True: One block = The ERP of one participan
+        # average_trial + average_participant: One block = The grand-average ERP
+        if np.isnan(R[b]).all():                     # empty block (rejected trial) → skip
+            continue
+        out[b] = per_channel(R[b], P[b], metric)    # returns 32 scores, one per electrode, stored in row b of out
 
-    Parameters
-    ----------
-    scores : DataArray from compute_metric
-    by_trial : keep one score per trial (only used if scores have an 'epoch' dim)
-    by_channel : keep one score per electrode
-    by_participant : keep one score per participant
-    agg : "mean" or "median" (median is more robust: single-trial scores have outliers)
+    coords = {d: real[d].values for d in lead}
+    coords["channel"] = real.channel.values
+    scores = xr.DataArray(out.reshape(*lead_shape, n_ch),
+                          dims=(*lead, "channel"), coords=coords)
 
-    Returns
-    -------
-    DataArray with only the kept dimensions (a single number if all are False).
-    NaNs (empty trials) are skipped.
-    """
-    dims = []
-    if not by_trial and "epoch" in scores.dims:
-        dims.append("epoch")
-    if not by_channel:
-        dims.append("channel")
-    if not by_participant:
-        dims.append("recording")
-    if not dims:
-        return scores
-    if agg == "mean":
-        return scores.mean(dim=dims, skipna=True)
-    if agg == "median":
-        return scores.median(dim=dims, skipna=True)
-    raise ValueError('agg must be "mean" or "median"')
+    # 3. Average the electrode scores (not the signals):
+    if average_channel:
+        if agg == "median":
+            scores = scores.median("channel", skipna=True)
+        else:
+            scores = scores.mean("channel", skipna=True)
 
-def score(real_ds, pred_ds, metric="r2", level="single",
-          by_trial=True, by_channel=True, by_participant=True,
-          agg="mean"):
-    """Compute a metric per electrode, then average it as requested (True = averaged)
-
-    Example: one R2 per participant, single trials, averaged over trials and electrodes
-        score(real, pred, "r2", level="single",
-              by_trial=False, by_channel=False, by_participant=True)
-    """
-    raw = compute_metric(real_ds, pred_ds, metric, level)
-    return average(raw, by_trial, by_channel, by_participant, agg)
+    return scores
