@@ -330,3 +330,48 @@ def score(real_ds, pred_ds, metric="r2",
             scores = scores.mean("channel", skipna=True)
 
     return scores
+
+
+
+
+# Test/Train split
+
+def split_trials(epoch_data, test_frac=0.2, seed=0, by="trial"):
+    """Choose which trials are held out for testing.
+
+    Parameters
+    ----------
+    test_frac : fraction of trials (or participants) used for testing.
+    seed      : random seed, so the split is reproducible.
+    by        : "trial"       -> random trials, mixed across participants.
+                                 Easy, but trials of one participant are
+                                 correlated, so the score is a bit optimistic.
+                "participant" -> whole participants are held out.
+                                 Stricter (tests generalisation to new people),
+                                 but needs several participants.
+
+    Returns
+    -------
+    Boolean DataArray (recording, epoch): True = test trial, False = train trial.
+    Cells that hold no data (rejected trials) are also assigned; they are NaN
+    and therefore ignored later.
+    """
+    rng = np.random.default_rng(seed)
+    n_rec = epoch_data.sizes["recording"]
+    n_ep = epoch_data.sizes["epoch"]
+
+    if by == "participant":
+        n_test = max(1, int(round(test_frac * n_rec)))
+        test_rec = rng.choice(n_rec, n_test, replace=False)
+        m = np.zeros((n_rec, n_ep), dtype=bool)
+        m[test_rec, :] = True
+    elif by == "trial":
+        m = rng.random((n_rec, n_ep)) < test_frac
+    else:
+        raise ValueError("by must be 'trial' or 'participant'")
+
+    return xr.DataArray(
+        m,
+        dims=("recording", "epoch"),
+        coords={"recording": epoch_data.recording, "epoch": epoch_data.epoch},
+    )
