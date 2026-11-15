@@ -175,7 +175,7 @@ def create_noise(recording, sfreq, n_trials, n_samples):
 
 Main entry point: `score_all(epoch_data, simulated, rt_samples)`.
 Both inputs are xarray Datasets with a 'data' variable and dims
-(recording, epoch, channel, sample), as returned by
+(recording(=participant), epoch(=trial), channel(=electrode), sample), as returned by
 `hmp.io.read_mne_epochs` and `simulate_from_hmpfit`.
 
 Metrics use sklearn.metrics where a function exists
