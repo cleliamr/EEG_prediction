@@ -185,3 +185,91 @@ def run_least_squares(epoch_data, weights, times, template_dict,
     pred_uv = predict_least_square(traces, W)
 
     return {"W": W, "pred_uv": pred_uv, "real_uv": real_uv, "test_mask": test_mask}
+
+
+
+
+# UPPER BOUND: separate weights for every trial (in-sample)
+
+def fit_per_trial(real_uv, traces, min_points=None, fit_intercept=True):
+    """Fit separate weights W[event, channel] for EACH trial, on that trial only.
+
+    Same model as before, pred[c, t] = sum_e W[e, c] * T_e(t), but the
+    least-squares problem is solved independently for every trial, using that
+    trial's own EEG. The weights therefore see the data they are supposed to
+    predict: this is NOT a prediction, it is an IN-SAMPLE UPPER BOUND on what
+    the chosen templates (half-sine shape, width) and the event times can
+    explain, if the topographies were perfectly tuned to each trial.
+
+    Caveat: each trial has n_events * n_channels free weights (e.g. 4 * 32 = 128)
+    fitted to one noisy trial, so part of the score is just noise being fitted.
+    Even pure noise would give an R2 of roughly n_events / n_samples per
+    electrode. Compare the score to that value (see `noise_floor`).
+
+    Parameters
+    ----------
+    real_uv : Dataset with the real EEG in microvolts (recording, epoch, channel, sample).
+    traces  : DataArray from `event_traces` (event, recording, epoch, sample).
+    min_points : minimum number of valid samples needed to fit a trial
+                 (default: number of events (+1 with intercept); fewer points than
+                 free parameters cannot be fitted).
+    fit_intercept : if True (default), a constant is fitted per trial and electrode
+                 in addition to the event weights. R2 is measured around the trial's
+                 mean, so without an intercept any DC offset of the trial counts as
+                 error and R2 can be strongly negative even in-sample. The intercept
+                 is included in the returned prediction but not in W.
+
+    Returns
+    -------
+    W       : DataArray (recording, epoch, event, channel), NaN for skipped trials.
+    pred_ds : Dataset with 'data' (recording, epoch, channel, sample), same layout
+              as epoch_data, NaN where the real data is NaN or the trial was skipped.
+    """
+    Y = real_uv["data"].transpose("recording", "epoch", "sample", "channel").values
+    X = traces.transpose("recording", "epoch", "sample", "event").values
+    n_rec, n_ep, n_s, n_ch = Y.shape
+    n_ev = X.shape[-1]
+    if min_points is None:
+        min_points = n_ev + int(fit_intercept)
+
+    W = np.full((n_rec, n_ep, n_ev, n_ch), np.nan)
+    pred = np.full_like(Y, np.nan)
+
+    for r in range(n_rec):
+        for e in range(n_ep):
+            # valid samples of this trial: before the RT, no NaN anywhere
+            valid = ~np.isnan(Y[r, e]).any(axis=-1) & ~np.isnan(X[r, e]).any(axis=-1)
+            if valid.sum() < min_points:
+                continue                     # unused trial, or too short to fit
+            Xi, Yi = X[r, e][valid], Y[r, e][valid]
+            if fit_intercept:
+                Xi = np.column_stack([Xi, np.ones(len(Xi))])   # constant column
+            Wi, *_ = np.linalg.lstsq(Xi, Yi, rcond=None)       # (event[+1], channel)
+            W[r, e] = Wi[:n_ev]
+            pred[r, e][valid] = Xi @ Wi
+
+    W = xr.DataArray(
+        W, dims=("recording", "epoch", "event", "channel"),
+        coords={"recording": real_uv.recording, "epoch": real_uv.epoch,
+                "event": traces.event, "channel": real_uv.channel},
+    )
+    pred_ds = xr.Dataset({"data": xr.DataArray(
+        pred, dims=("recording", "epoch", "sample", "channel"),
+        coords={"recording": real_uv.recording, "epoch": real_uv.epoch,
+                "sample": real_uv.sample, "channel": real_uv.channel},
+    ).transpose("recording", "epoch", "channel", "sample")})
+    return W, pred_ds
+
+
+# R2 is only noise predicted
+
+def noise_floor(real_uv, n_events):  # pass n_events only; the intercept costs one sample (n-1)
+    """Rough R2 that fitting n_events regressors to PURE NOISE would give.
+
+    For a regression with k free regressors on n samples of noise, the expected
+    in-sample R2 is about k / n. Returned per trial (recording, epoch), using the
+    number of valid samples of each trial. If the per-trial upper bound is close
+    to this value, the fit is mostly explained by overfitting noise.
+    """
+    n_valid = real_uv["data"].notnull().any("channel").sum("sample")
+    return n_events / (n_valid - 1).where(n_valid > 1)   # -1: centering removes one dimension
