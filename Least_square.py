@@ -82,7 +82,7 @@ def event_traces(epoch_data, weights, times, template_dict):
 
 # Fit: ordinary least squares
 
-def fit_weights(real_uv, traces, train_mask):
+def fit_weights(real_uv, traces, train_mask, fit_intercept=True):
     """Find the weights W[event, channel] that best explain the training EEG.
 
     We stack all valid (trial, sample) points of the training trials into rows:
@@ -109,27 +109,28 @@ def fit_weights(real_uv, traces, train_mask):
     # Put the axes in a known order: (recording, epoch, sample, channel/event)
     Y = real_uv["data"].transpose("recording", "epoch", "sample", "channel").values
     X = traces.transpose("recording", "epoch", "sample", "event").values
-
+    n_ev = X.shape[-1]
     # True where the point is usable: no NaN anywhere AND in a training trial
     valid = (
         ~np.isnan(Y).any(axis=-1)
         & ~np.isnan(X).any(axis=-1)
         & train_mask.values[:, :, None]      # (recording, epoch) -> add sample axis
     )
+    Xv, Yv = X[valid], Y[valid]  # now 2D
+    if fit_intercept:
+        Xv = np.column_stack([Xv, np.ones(len(Xv))])  # constant column
 
-    W, *_ = np.linalg.lstsq(X[valid], Y[valid], rcond=None)   # (event, channel)
+    coef, *_ = np.linalg.lstsq(Xv, Yv, rcond=None)  # (n_ev [+1], channel)
 
-    return xr.DataArray(
-        W,
-        dims=("event", "channel"),
-        coords={"event": traces.event, "channel": real_uv.channel},
-    )
-
-
+    W = xr.DataArray(coef[:n_ev], dims=("event", "channel"),
+                     coords={"event": traces.event, "channel": real_uv.channel})
+    b = (xr.DataArray(coef[n_ev], dims="channel",
+                      coords={"channel": real_uv.channel}) if fit_intercept else None)
+    return W, b
 
 # Predict
 
-def predict_least_square(traces, W):
+def predict_least_square(traces, W, b=None):
     """Predicted EEG = sum over events of W[e, c] * T_e(t), for ALL trials.
 
     Returns a Dataset with a 'data' variable and dims
@@ -138,6 +139,8 @@ def predict_least_square(traces, W):
     NaN stays NaN (unused trials, samples after the RT).
     """
     pred = xr.dot(traces, W, dim="event")      # (recording, epoch, sample, channel)
+    if b is not None:
+        pred = pred + b
     return xr.Dataset(
         {"data": pred.transpose("recording", "epoch", "channel", "sample")}
     )
@@ -182,10 +185,10 @@ def run_least_squares(epoch_data, weights, times, template_dict,
     traces = event_traces(epoch_data, weights, times, template_dict)
     test_mask = split_trials(epoch_data, test_frac=test_frac, seed=seed, by=by)
 
-    W = fit_weights(real_uv, traces, ~test_mask)
-    pred_uv = predict_least_square(traces, W)
+    W, b = fit_weights(real_uv, traces, ~test_mask)
+    pred_uv = predict_least_square(traces, W,b )
 
-    return {"W": W, "pred_uv": pred_uv, "real_uv": real_uv, "test_mask": test_mask}
+    return {"W": W,"b": b, "pred_uv": pred_uv, "real_uv": real_uv, "test_mask": test_mask}
 
 
 
