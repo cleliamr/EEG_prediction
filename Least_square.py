@@ -14,7 +14,7 @@ In `simulate_from_hmpfit` the weights are read from each trial's own data
 (one scalp map per trial and event). That is not a real prediction, because
 the weights already "saw" the trial they are supposed to predict.
 
-Here we instead learn ONE weight per (event, electrode), shared by all trials:
+Here we instead try to learn one weight per (event, electrode), shared by all trials:
 
     1. Split the trials into a training set and a test set.
     2. Build T_e(t) for every trial (reusing the simulation code).
@@ -70,8 +70,9 @@ def event_traces(epoch_data, weights, times, template_dict):
     traces = []
     for e in range(weights.sizes["event"]):
         w = xr.zeros_like(weights)
-        w.values[0, :, e] = 1.0          # electrode 0, all trials, event e only
-        sim = simulate_from_hmpfit(epoch_data, w, times, template_dict)
+        w.values[0, :, e] = 1.0          # electrode 0, all trials, event e only -> at end you get a matrice with 1 alternatively for each event
+                                            # T_e(t) is the same on every electrode/ all the electrodes have same events times so only done for one electrode
+        sim = simulate_from_hmpfit(epoch_data, w, times, template_dict)  # dims (recording = nbr of subjects, epoch = trials, channel = electrodes, sample = length of epoch)
         traces.append(
             sim["data"].isel(channel=0).transpose("recording", "epoch", "sample")
         )
@@ -98,7 +99,7 @@ def fit_weights(real_uv, traces, train_mask):
       - the real EEG is not NaN on any electrode (valid sample before the RT),
       - the bumps are not NaN (same condition, since both come from epoch_data).
 
-    The test trials are never touched here, so they can serve as an honest
+    The test trials are never touched here, so they can serve as an
     evaluation afterwards.
 
     Returns
@@ -203,8 +204,8 @@ def fit_per_trial(real_uv, traces, min_points=None, fit_intercept=True):
 
     Caveat: each trial has n_events * n_channels free weights (e.g. 4 * 32 = 128)
     fitted to one noisy trial, so part of the score is just noise being fitted.
-    Even pure noise would give an R2 of roughly n_events / n_samples per
-    electrode. Compare the score to that value (see `noise_floor`).
+    See below for what R2 score fitting pure noise would giveEven pure noise would
+    give (see `noise_floor`).
 
     Parameters
     ----------
@@ -230,13 +231,13 @@ def fit_per_trial(real_uv, traces, min_points=None, fit_intercept=True):
     n_rec, n_ep, n_s, n_ch = Y.shape
     n_ev = X.shape[-1]
     if min_points is None:
-        min_points = n_ev + int(fit_intercept)
+        min_points = n_ev + int(fit_intercept)   # n_ev + 1 if intercept = True
 
-    W = np.full((n_rec, n_ep, n_ev, n_ch), np.nan)
-    pred = np.full_like(Y, np.nan)
+    W = np.full((n_rec, n_ep, n_ev, n_ch), np.nan)   # set w matrix dimension
+    pred = np.full_like(Y, np.nan)                          # set pred matrix dimension
 
-    for r in range(n_rec):
-        for e in range(n_ep):
+    for r in range(n_rec):       #for each subject
+        for e in range(n_ep):     #for each event
             # valid samples of this trial: before the RT, no NaN anywhere
             valid = ~np.isnan(Y[r, e]).any(axis=-1) & ~np.isnan(X[r, e]).any(axis=-1)
             if valid.sum() < min_points:
@@ -245,8 +246,8 @@ def fit_per_trial(real_uv, traces, min_points=None, fit_intercept=True):
             if fit_intercept:
                 Xi = np.column_stack([Xi, np.ones(len(Xi))])   # constant column
             Wi, *_ = np.linalg.lstsq(Xi, Yi, rcond=None)       # (event[+1], channel)
-            W[r, e] = Wi[:n_ev]
-            pred[r, e][valid] = Xi @ Wi
+            W[r, e] = Wi[:n_ev]             #add output of least_square for subject r, event e to weight matrix
+            pred[r, e][valid] = Xi @ Wi     #add prediction by computing Y = Xw to prediction matrix
 
     W = xr.DataArray(
         W, dims=("recording", "epoch", "event", "channel"),
@@ -261,10 +262,10 @@ def fit_per_trial(real_uv, traces, min_points=None, fit_intercept=True):
     return W, pred_ds
 
 
-# R2 is only noise predicted
+# R2 if only noise predicted
 
 def noise_floor(real_uv, n_events):  # pass n_events only; the intercept costs one sample (n-1)
-    """Rough R2 that fitting n_events regressors to PURE NOISE would give.
+    """Rough R2 that fitting n_events regressors to pure noise would give.
 
     For a regression with k free regressors on n samples of noise, the expected
     in-sample R2 is about k / n. Returned per trial (recording, epoch), using the
