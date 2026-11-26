@@ -61,6 +61,8 @@ class EvidenceAccumulation:
         trace = self.traces[closest_idx]
         return trace[:int(time)+1]
 
+
+
 def simulate_from_hmpfit(epoch_data,
                          weights,
                          times,
@@ -170,3 +172,16 @@ def create_noise(recording, sfreq, n_trials, n_samples):
         noise_matrix[trial] = noise
     return noise_matrix
 
+def split_trials(epoch_data, test_frac=0.2, seed=0, by="trial"):
+    """Boolean DataArray (recording, epoch): True = test. by='trial' or 'participant'."""
+    rng = np.random.default_rng(seed)
+    n_rec, n_ep = epoch_data.sizes['recording'], epoch_data.sizes['epoch']
+    if by == "participant":
+        n_test = max(1, int(round(test_frac * n_rec)))
+        test_rec = rng.choice(n_rec, n_test, replace=False)
+        m = np.zeros((n_rec, n_ep), bool)
+        m[test_rec, :] = True
+    else:
+        m = rng.random((n_rec, n_ep)) < test_frac
+    return xr.DataArray(m, dims=('recording', 'epoch'),
+                        coords={'recording': epoch_data.recording, 'epoch': epoch_data.epoch})
