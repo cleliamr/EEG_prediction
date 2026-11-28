@@ -315,6 +315,7 @@ class EventWidthCV:
                 best : {event: best width} from the last pass.
                 """
         widths_grid = list(widths_grid)
+
         if half_width is None:
             half_width = int(np.ceil(max(widths_grid) / 1000 * self.sfreq / 2))
         current = as_widths(base_widths, self.n_events)

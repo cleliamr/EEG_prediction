@@ -19,6 +19,11 @@ class HalfSine:
         steps = 1000/sfreq
         width_samples = width/steps
 
+        # CHANGED: against float noise: width that is (almost) an exact number of
+        # samples must give exactly that number (27.344 ms at 256 Hz = 7.00006 -> 7, not 8 through np.arange)
+        if abs(width_samples - round(width_samples)) < 1e-3:
+            width_samples = round(width_samples)
+
         # time (ms) of each sample of the bump, taken at the middle of each sample
         event_idx = np.arange(width_samples) * steps + steps / 2
         # gives event frequency given that events are defined as half-sines

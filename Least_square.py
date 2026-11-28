@@ -42,7 +42,8 @@ weights are readable. R2 does not change when the data is rescaled.
 import numpy as np
 import xarray as xr
 
-from helper_functions import simulate_from_hmpfit, split_trials
+from helper_functions import simulate_from_hmpfit
+from Scoring import split_trials
 
 UV = 1e6  # volts -> microvolts
 
@@ -277,3 +278,50 @@ def noise_floor(real_uv, n_events):  # pass n_events only; the intercept costs o
     """
     n_valid = real_uv["data"].notnull().any("channel").sum("sample")
     return n_events / (n_valid - 1).where(n_valid > 1)   # -1: centering removes one dimension
+
+def fit_weights_per_participant(real_uv, traces, train_mask, fit_intercept=True):
+    """Same as fit_weights, but one least-squares fit PER PARTICIPANT
+    (each participant gets its own scalp map per event)."""
+    W_list, b_list = [], []
+    for r in real_uv.recording.values:
+        W_r, b_r = fit_weights(real_uv.sel(recording=[r]),
+                               traces.sel(recording=[r]),
+                               train_mask.sel(recording=[r]),
+                               fit_intercept)
+        W_list.append(W_r)
+        b_list.append(b_r)
+    W = xr.concat(W_list, dim="recording").assign_coords(recording=real_uv.recording.values)
+    b = (xr.concat(b_list, dim="recording").assign_coords(recording=real_uv.recording.values)
+         if fit_intercept else None)
+    return W, b                                         # W: (recording, event, channel)
+
+def run_least_squares_participants(epoch_data, weights, times, template_dict,
+                      test_frac=0.2, seed=0, by="trial"):
+    """Split, fit on the training trials and predict all trials.
+
+    Returns
+    -------
+    dict with
+      'W'         : fitted weights (event, channel), in microvolts
+      'pred_uv'   : predicted EEG in microvolts (Dataset)
+      'real_uv'   : real EEG in microvolts (Dataset)
+      'test_mask' : True for the held-out trials (recording, epoch)
+
+    Example
+    -------
+    out = run_least_squares(epoch_data, weights, times, pattern_assumption)
+    test = out['test_mask']
+    r2_test  = score(only(out['real_uv'], test),  only(out['pred_uv'], test),  "r2")
+    r2_train = score(only(out['real_uv'], ~test), only(out['pred_uv'], ~test), "r2")
+    """
+    # Real EEG in microvolts
+    real_uv = epoch_data.copy()
+    real_uv["data"] = epoch_data["data"] * UV
+
+    traces = event_traces(epoch_data, weights, times, template_dict)
+    test_mask = split_trials(epoch_data, test_frac=test_frac, seed=seed, by=by)
+
+    W, b = fit_weights_per_participant( real_uv, traces, ~test_mask)
+    pred_uv = predict_least_square(traces, W,b )
+
+    return {"W": W,"b": b, "pred_uv": pred_uv, "real_uv": real_uv, "test_mask": test_mask}
