@@ -103,8 +103,8 @@ def average_signals(da, average_trial=False, average_participant=False):
 # 3. Score
 # -----------------------------------------------------------------------------
 def score(real_ds, pred_ds, metric="r2",
-          average_trial=False, average_participant=False, average_channel=False,
-          agg="mean"):
+              average_trial=False, average_participant=False, average_channel=False,
+              agg="mean", min_trial_frac=0.5):
     """Average the signals as requested, then compute `metric` per electrode.
 
     Parameters
@@ -115,7 +115,7 @@ def score(real_ds, pred_ds, metric="r2",
     average_participant : True -> average the signals over participants before scoring
     average_channel : True -> average the electrode SCORES at the end
     agg : "mean" or "median", used only to average the electrode scores
-
+    min_trial_frac: cutoff for grand average to account for fact that all trials don't have the same length.
     Returns
     -------
     xarray DataArray with the kept dims (see the table at the top of the file).
@@ -130,6 +130,14 @@ def score(real_ds, pred_ds, metric="r2",
     # Same NaNs in both, BEFORE averaging: both averages then use exactly the same trials
     valid = real.notnull() & pred.notnull()
     real, pred = real.where(valid), pred.where(valid)
+
+    # Averaging over trials: keep only the samples where at least `min_trial_frac`
+    # of the scored trials are still running (they stop at their RT)
+    if (average_trial or average_participant) and min_trial_frac:
+        running = valid.any("channel").sum(["recording", "epoch"])  # trials left at each sample
+        n_total = valid.any(["channel", "sample"]).sum(["recording", "epoch"])
+        keep = running >= min_trial_frac * n_total  # (sample,)
+        real, pred = real.where(keep), pred.where(keep)
 
     # 1. Average the signals
     with np.errstate(invalid="ignore"):  # ignore warning (samples after every RT -> empty mean)
@@ -176,6 +184,16 @@ def score(real_ds, pred_ds, metric="r2",
 
     return scores
 
+
+# keep only the samples where at least `min_trial_frac` of the scored trials are still running
+def trial_cutoff(real_ds, min_frac=0.5, trial_mask=None):
+    """Last sample at which at least `min_frac` of the trials are still running."""
+    ok = real_ds["data"].notnull().all("channel")                  # (recording, epoch, sample)
+    if trial_mask is not None:
+        ok = ok & trial_mask
+    running = ok.sum(["recording", "epoch"])
+    n_total = ok.any("sample").sum(["recording", "epoch"])
+    return int(running.sample.where(running >= min_frac * n_total).max())
 
 # Test/Train split
 
